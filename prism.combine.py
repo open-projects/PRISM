@@ -6,57 +6,75 @@ import argparse
 import pandas as pd
 import sqlite3
 import warnings
+import glob
+
+
+# You need a sample description file to run the script
+
+# ######### Sample description file format (tab delimited) #######################
+# Source_File                     Sample_Name  Sample_Replica  Sample_Type       #
+# HF2_YS_14535_1043_18082021.raw  SCC1         R1              ko                #
+# HF2_YS_14535_1042_18082021.raw  SCC1         R2              ko                #
+# HF2_YS_14535_1047_18082021.raw  WT           R1              wt                #
+# ################################################################################
+
+# Annotated file names have to start with a category name delimited by '.'
+# For example: frameshift.sample_name.csv.gz.pep.annotated.csv.gz or prio2.sample_name.csv.gz.pep.annotated.csv.gz
+# The hash below describes the categories:
+DEFAULT_CATS = {
+    'frameshift': 'CDS,UTR5,OffFrame,UTR3,ncRNA,Frameshift,Intronic,Intergenic',
+    'prio1': 'Extra,CDS,UTR5,OffFrame,UTR3,ncRNA,Intronic,Intergenic',
+    'prio2': 'CDS,Extra,UTR5,OffFrame,UTR3,ncRNA,Intronic,Intergenic',
+    'prio3': 'CDS,UTR5,OffFrame,UTR3,ncRNA,Extra,Intronic,Intergenic',
+}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PRISM combiner")
+    parser = argparse.ArgumentParser(description="PRISM combiner. It takes all {category}.*.pep.annotated.csv.gz files "
+                                                 "and combines them into one output file")
 
-    parser.add_argument('-i', nargs='+', default=[], required=True, help="input CSV file list (files can be gzipped)")
-    parser.add_argument('-s', required=True, help='tab delimited file with the description of samples: '
-                                                  'Source_File	Sample_Name	Sample_Replica	Sample_Type')
-    parser.add_argument('-p', nargs='+', default=[], required=False,
-                        help='list of PRISM databases used for input files (prio1 or prio2 or extra or smth else)')
-    parser.add_argument('-d', default='\t', required=False, help='input CSV file delimiter')
-    parser.add_argument('-db', required=False, help='database file (if not specified, the data will store in memory)')
+    parser.add_argument('-i', required=True, help="input directory (all files must be in the directory)")
+    parser.add_argument('-s', default='sample_description.csv', required=True,
+                        help='tab delimited file with the description of samples: '
+                             'Source_File	Sample_Name	Sample_Replica	Sample_Type')
+    parser.add_argument('-d', default=',', required=False, help='input CSV file delimiter')
+    parser.add_argument('-db', required=False,
+                        help='database file (if not specified, the data will be stored in memory)')
     parser.add_argument('-q', default=0.01, required=False, help='Q threshold (default Q<0.01 = 1%FDR)')
     parser.add_argument('-o', default='combined_results.csv.gz', required=False, help='output file with results')
 
     args = parser.parse_args()
 
-    input_file_list = args.i
+    input_dir = re.sub(r'/$', '', args.i)
     sample_file = args.s
-    output_file = args.o
-    run_names = args.p
     csv_delimiter = args.d
     db_file = args.db
     q_threshold = args.q
-
-    if not len(run_names):
-        for file_name in input_file_list:
-            file_name = re.sub(r'.*\/', '', file_name)
-            file_name = re.sub(r'\..*', '', file_name)
-            run_names.append(file_name)
-    else:
-        if len(run_names) != len(input_file_list):
-            print("Wrong amount of run names: {} (should be {})".format(len(run_names), len(input_file_list)))
-            exit(1)
+    output_file = args.o
 
     all_data = []
-    for i, file_name in enumerate(input_file_list):
-        if re.search(r'\.gz$', file_name):
-            data = pd.read_csv(file_name, compression='gzip', sep=csv_delimiter, quotechar='"', low_memory=False)
-        else:
-            data = pd.read_csv(file_name, sep=csv_delimiter, quotechar='"', low_memory=False)
+    for file_path in glob.glob(input_dir + '/*.pep.annotated.csv.gz'):
+        file_name = os.path.basename(file_path)
+        category = re.sub(r'\..*', '', file_name)
+        if category not in DEFAULT_CATS:
+            print('Wrong file name {} (no category in the file name)'.format(file_name))
+            exit(1)
 
-        data['Databases_PRISM'] = run_names[i]
+        data = pd.read_csv(file_path, compression='gzip', sep=csv_delimiter, quotechar='"', low_memory=False)
+        data['Databases_PRISM'] = category
         all_data.append(data)
 
     all_data = pd.concat(all_data)
+    all_data = all_data[all_data['Decoy'] != 'D']
 
     warnings.simplefilter(action='ignore', category=FutureWarning)  # to suppress FutureWarning
     all_data.columns = all_data.columns.str.replace('[%()/*:]', '')
     all_data.columns = all_data.columns.str.strip().str.replace('[ .-]', '_')
     all_data.columns = all_data.columns.str.strip().str.replace('_+', '_')
+
+    all_data['HLA_allele'] = all_data['HLA_allele'].str.replace('^.$', '')
+    all_data['HLA_allele'] = all_data['HLA_allele'].str.replace('[*:]', '')
+    all_data['HLA_allele'] = all_data['HLA_allele'].str.replace('-', '_')
 
     if db_file:
         if os.path.exists(db_file):
@@ -117,11 +135,8 @@ def main():
             best_alc_rec = pd.read_sql(sql, connector)
             best_alc = best_alc_rec.iloc[0]['ALC']  # average local confidence (ALC)
 
-            best_peptide_rec['HLA_allele'] = best_peptide_rec['HLA_allele'].str.replace(r'[*:]', '')
-            best_peptide_rec['HLA_allele'] = best_peptide_rec['HLA_allele'].str.replace(r'-', '_')
-
             best_hla = best_peptide_rec.iloc[0]['HLA_allele']
-            filtered_hla = best_hla if best_hla in best_peptide_rec.columns and best_peptide_rec.iloc[0][best_hla] < 2 else ''
+            filtered_hla = best_hla if re.search(r'HLA', best_hla) and best_hla in best_peptide_rec.columns and best_peptide_rec.iloc[0][best_hla] < 2 else ''
 
             sql = 'SELECT group_concat(DISTINCT Category) AS Categories FROM ext_data WHERE Sequence = "{}";'.format(peptide)
             categories_rec = pd.read_sql(sql, connector)
@@ -174,13 +189,13 @@ def main():
                             'Top_location_count_no_decoy', 'Q', 'Gene', 'Symbol', 'ORF_location', 'HLA_allele',
                             'netMHC_rank']
             data_output_rec = best_peptide_rec[base_columns + hla_columns]
-            data_output_rec['Filtered_HLA_allele'] = filtered_hla
-            data_output_rec['Best_Q'] = best_q
-            data_output_rec['Best_ALC'] = best_alc
-            data_output_rec['Categories'] = categories
-            data_output_rec['Status_over_sequence'] = status
-            data_output_rec['Databases_PRISM'] = db_prism
-            data_output_rec['Samples'] = samples
+            data_output_rec = data_output_rec.assign(Filtered_HLA_allele=filtered_hla)
+            data_output_rec = data_output_rec.assign(Best_Q=best_q)
+            data_output_rec = data_output_rec.assign(Best_ALC=best_alc)
+            data_output_rec = data_output_rec.assign(Categories=categories)
+            data_output_rec = data_output_rec.assign(Status_over_sequence=status)
+            data_output_rec = data_output_rec.assign(Databases_PRISM=db_prism)
+            data_output_rec = data_output_rec.assign(Samples=samples)
             for index, item in enumerate(replica_counts):
                 data_output_rec[item['sample']] = item['rep_count']
             data_output_rec['Intensity_Sum'] = intensity_sum
