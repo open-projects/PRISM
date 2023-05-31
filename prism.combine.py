@@ -40,7 +40,7 @@ def main():
     parser.add_argument('-d', default=',', required=False, help='input CSV file delimiter')
     parser.add_argument('-db', required=False,
                         help='database file (if not specified, the data will be stored in memory)')
-    parser.add_argument('-q', default=0.01, required=False, help='Q threshold (default Q<0.01 = 1%FDR)')
+    parser.add_argument('-q', default=2, required=False, help='Q threshold (default: no filtering)')
     parser.add_argument('-o', default='combined_results.csv.gz', required=False, help='output file with results')
 
     args = parser.parse_args()
@@ -49,7 +49,7 @@ def main():
     sample_file = args.s
     csv_delimiter = args.d
     db_file = args.db
-    q_threshold = args.q
+    q_threshold = float(args.q)
     output_file = args.o
 
     all_data = []
@@ -114,18 +114,22 @@ def main():
         print("You probably have an incorrect file with the description of the samples")
         exit(1)
 
-    # FROM Andreas's email:
+    # FROM Andreas's emails:
     # I typically filter by Q (e.g. Q<0.01 = 1%FDR) and by NetMHC predictions (e.g. rank<2%).
     # I generate this column in Spotfire. Best Q is the lowest Q value for a peptide sequence among all merged samples.
     # I.e., when a peptide is reliably identified in sample 1 (e.g. Q<0.01) and in sample 2 Q>0.01,
     # the peptide is still counted as identified in both samples. This increases the overlap between merged samples.
+    #
+    # "best ALC" gives you the highest ALC of a sequence over all combined analyses.
+    # If you compare "best ALC" and "best Q" you will see that the values correlate.
+    # Typically, the sequence with the best ALC will have lowest best Q value. However, there can be exceptions.
 
     data_output = None
 
     sql = 'SELECT Sequence FROM peptides;'
     peptides = pd.read_sql(sql, connector)
     for peptide in peptides['Sequence']:
-        print(peptide)
+        print(peptide + ' ' * 20, end="\r")
         sql = 'SELECT * FROM ext_data WHERE Sequence = "{}" ORDER BY Q, netMHC_rank LIMIT 1;'.format(peptide)
         best_peptide_rec = pd.read_sql(sql, connector)
         if len(best_peptide_rec.index) and best_peptide_rec.iloc[0]['Q'] < q_threshold:
@@ -147,8 +151,8 @@ def main():
             status_rec = pd.read_sql(sql, connector)
             status = status_rec.iloc[0]['Types']
 
-            sql = 'SELECT group_concat(DISTINCT Databases_PRISM) AS Databases_PRISMs FROM ext_data ' \
-                  'WHERE Sequence = "{}";'.format(peptide)
+            sql = 'SELECT group_concat(DISTINCT Databases_PRISM) AS Databases_PRISMs FROM ' \
+                  '(SELECT Databases_PRISM FROM ext_data WHERE Sequence = "{}" ORDER BY Databases_PRISM);'.format(peptide)
             db_prism_rec = pd.read_sql(sql, connector)
             db_prism = db_prism_rec.iloc[0]['Databases_PRISMs']
 
@@ -213,6 +217,7 @@ def main():
     else:
         data_output.to_csv(output_file, sep='\t', index=False)
 
+    print(' ' * 20, end="\r")
     print("...done")
 
 # end of main()
